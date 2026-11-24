@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Launcher for the interactive CloudLab reservation shell.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$DIR/.venv/bin/python" "$DIR/cloudshell.py" "$@"

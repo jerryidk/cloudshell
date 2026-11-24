@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloudshell"
+version = "2.0.0"
+description = "Interactive CloudLab machine finder and reservation shell"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "httpx>=0.20,<0.28",
+    "python-dateutil>=2.8",
+    "keyring>=24",          # macOS Keychain / Linux Secret Service
+    "prompt_toolkit>=3",
+]
+
+[project.optional-dependencies]
+# Slow Portal-API search fallback (needs an API token in cloudlab.jwt)
+api = ["portal-api @ git+https://gitlab.flux.utah.edu/emulab/portal-api.git"]
+
+[project.scripts]
+cloudshell = "cloudshell:main"
+
+[tool.setuptools]
+py-modules = ["cloudshell"]

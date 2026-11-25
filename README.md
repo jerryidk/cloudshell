@@ -52,8 +52,35 @@ get your account or IP temporarily frozen by CloudLab.
 | `reserve <#> [-r REASON]` | Reserve that row's slot from the last `find`. It is validated first, and you see whether it will be auto-approved before confirming. |
 | `mine` | Your project's reservations |
 | `cancel <id>` | Delete a reservation (an id prefix is fine) |
+| `exps [-a] [-m] [-f REGEX]` | Your running experiments (yours and your projects'), soonest to expire first. `-a` includes ended ones and `-m` shows only ones you created. |
+| `exp <#\|name>` | Nodes of one experiment: host, type, image, blockstores, ssh command |
+| `keep-alive <#\|name> [--by 3d] [--lead 2d] [--until DATE] [-r REASON] [--no-reserve] [-n]` | Keep an experiment alive (see below). `-n` is a dry run. |
+| `keep-alive` / `unalive <#>` | List kept-alive experiments / stop keeping one alive |
+| `keep-alive tick\|install\|uninstall\|log` | Check now / run the check every 30 min in the background / remove the timer / show what it did |
 | `/TEXT` | Search the last output; `/` on its own shows everything again |
 | `project NAME`, `refresh`, `help`, `quit` | |
+
+## Keeping experiments alive
+
+`keep-alive 2` (a row from `exps`) puts that experiment on a watch list. Each
+check works like this:
+
+- When less than `--lead` (default 2 days) is left, it asks CloudLab to extend
+  the experiment by `--by` (default 3 days), never past `--until`.
+- If the extension isn't fully granted (an admin has to approve it, or it's
+  refused), it reserves the same node types from the experiment's expiry for
+  the same length, so the machines are held for you. Turn this off with
+  `--no-reserve`.
+- After a request that isn't fully granted, it waits 24 hours before asking
+  again. If CloudLab says an extension is the "final" one, it stops asking.
+  CloudLab penalizes repeated last-minute requests, so asking early and not
+  re-asking matters.
+
+The checks run only when `keep-alive tick` runs. `keep-alive install` runs it
+every 30 minutes with a systemd user timer (Linux) or a launchd agent (macOS),
+using the session and password in your keychain. That works while you're
+logged in and the keychain is unlocked. `unalive` takes an experiment off the
+list, and any reservation it made stays (remove it with `cancel`).
 
 ## Where the data comes from
 

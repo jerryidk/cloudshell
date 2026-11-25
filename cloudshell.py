@@ -110,6 +110,53 @@ def fmt_hours(h: int) -> str:
     return (f"{d}d" if d else "") + (f"{r}h" if r or not d else "")
 
 
+def fmt_left(h: float) -> str:
+    """Hours remaining -> '3d4h', '5h07m', 'expired'."""
+    if h <= 0:
+        return "expired"
+    if h < 24:
+        return f"{int(h)}h{int(h * 60) % 60:02d}m"
+    return fmt_hours(int(h))
+
+
+def _plain(v) -> str:
+    """Server text (may contain HTML) -> one plain line."""
+    s = html.unescape(re.sub(r"<[^>]+>", " ", str(v or "")))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def resv_summary(d: dict) -> tuple[bool, bool, list[str], str]:
+    """A resgroup Validate/Reserve reply -> (ok, needs_approval, problems, uuid)."""
+    code, v = d.get("code"), d.get("value")
+    if code:
+        problems = []
+        if isinstance(v, dict):
+            for k, msg in v.items():
+                if k == "clusters" and isinstance(msg, dict):
+                    for cl in msg.values():
+                        for f, err in ((cl or {}).get("errors") or {}).items():
+                            problems.append(f"{(cl or {}).get('type')}: {f}: {err}")
+                else:
+                    problems.append(f"{k}: {_plain(msg)}")
+        else:
+            problems.append(_plain(v))
+        return False, False, problems, ""
+    v = v if isinstance(v, dict) else {}
+    cr = v.get("cluster_results") or {}
+    problems, needs_approval, hard = [], False, bool(cr.get("errors"))
+    for res in (cr.get("clusters") or {}).values():
+        res = res or {}
+        for k in ("errors", "error", "conflict"):
+            if res.get(k):
+                problems.append(f"{res.get('count')}x {res.get('type')}: {k}: {_plain(res[k])}")
+                hard = hard or k != "conflict"
+        if not res.get("approved"):
+            needs_approval = True
+    if cr.get("errors"):
+        problems.append(_plain(cr["errors"]))
+    return not hard, needs_approval, problems, str(v.get("uuid") or "")
+
+
 class Output:
     """A block of printed lines kept around so '/' can search it."""
 
@@ -737,6 +784,98 @@ class WebPortal:
     def delete_resgroup(self, uuid: str) -> dict:
         return self.ajax("resgroup", "Delete", {"uuid": uuid})
 
+    # ---- experiments ---------------------------------------------------
+    def list_experiments(self) -> list[dict]:
+        """Experiments you created plus those in your projects (same call as
+        user-dashboard.php#experiments). Each dict gets 'pid' and 'exp' added."""
+        if not self.uid:
+            self.login()
+        d = self.ajax("user-dashboard", "ExperimentList", {"uid": self.uid})
+        if d.get("code"):
+            raise ValueError(f"could not list experiments: {d.get('value')}")
+        v = d.get("value")
+        seen: dict[str, dict] = {}
+        for group in ("user_experiments", "project_experiments"):
+            exps = v.get(group) if isinstance(v, dict) else None
+            for key, b in (exps.items() if isinstance(exps, dict) else []):
+                if not isinstance(b, dict) or not b.get("uuid"):
+                    continue
+                b = dict(b)
+                b["pid"], _, b["exp"] = key.partition(":")       # key is "pid:name"
+                seen.setdefault(b["uuid"], b)
+        return list(seen.values())
+
+    def experiment_nodes(self, uuid: str) -> list[dict]:
+        """Nodes of one experiment, parsed from its manifest(s)."""
+        d = self.ajax("status", "GetInstanceManifest", {"uuid": uuid})
+        if d.get("code"):
+            raise ValueError(f"could not get manifest: {d.get('value')}")
+        v = d.get("value")
+        nodes = []
+        for agg_urn, xml in (v.items() if isinstance(v, dict) else []):
+            nodes.extend(parse_manifest_nodes(xml, agg_urn, self.uid))
+        return nodes
+
+    def max_extension(self, uuid: str) -> dict:
+        """How far the experiment could be extended right now (no change made)."""
+        return self.ajax("status", "MaxExtension", {"uuid": uuid})
+
+    def request_extension(self, uuid: str, hours: int, reason: str) -> dict:
+        """Ask CloudLab to add `hours` to the experiment. Reply value on success:
+        {expiration, granted (hours), message, warning}; granted may be less than
+        asked, with the rest waiting for an administrator."""
+        return self.ajax("status", "RequestExtension",
+                         {"uuid": uuid, "howlong": str(int(hours)), "reason": reason})
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _urn_tail(urn: str) -> str:
+    """'urn:...+node+flex12' -> 'flex12'; '...+image+emulab-ops//UBUNTU24' -> 'UBUNTU24'."""
+    tail = urn.rsplit("+", 1)[-1]
+    return tail.rsplit("//", 1)[-1] or urn
+
+
+def parse_manifest_nodes(xml: str, agg_urn: str, uid: Optional[str]) -> list[dict]:
+    """Return [{client_id, host, type, image, image_urn, ssh, blockstores, cluster_urn}]."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return []
+    out = []
+    for n in root:
+        if _local(n.tag) != "node":
+            continue
+        info = {"client_id": n.get("client_id", "?"),
+                "host": _urn_tail(n.get("component_id", "")) or "-",
+                "cluster_urn": n.get("component_manager_id", agg_urn),
+                "type": "-", "image": "-", "image_urn": "", "ssh": "-",
+                "blockstores": []}
+        logins = []
+        for e in n.iter():
+            t = _local(e.tag)
+            if t == "hardware_type" and e.get("name"):
+                info["type"] = e.get("name")
+            elif t == "vnode" and e.get("hardware_type") and info["type"] == "-":
+                info["type"] = e.get("hardware_type")
+            elif t == "disk_image" and e.get("name"):
+                info["image_urn"] = e.get("name")
+                info["image"] = _urn_tail(e.get("name"))
+            elif t == "blockstore" and e.get("mountpoint"):
+                info["blockstores"].append(e.get("mountpoint"))
+            elif t == "login" and e.get("hostname"):
+                logins.append((e.get("username"), e.get("hostname"), e.get("port", "22")))
+        mine = [lg for lg in logins if uid and lg[0] == uid]
+        if mine or logins:
+            user, host, port = (mine or logins)[0]
+            user = user if mine else (uid or user)
+            info["ssh"] = f"ssh {user}@{host}" + ("" if port == "22" else f" -p {port}")
+        out.append(info)
+    return out
+
 
 def forecast_steps(series: list) -> list[tuple[int, int]]:
     """[{t, free, ...}, ...] -> sorted [(t, free)]; for duplicate timestamps
@@ -844,36 +983,59 @@ def split_opts(tokens: list[str], spec: dict[str, str]) -> tuple[dict, list[str]
 # the shell
 # --------------------------------------------------------------------------
 HELP = """\
-Commands  (times are local: {tz})
+Times are local ({tz}).  # = a row number from the last listing.
 
+FIND & RESERVE MACHINES
   find [START] [LENGTH] [-n COUNT] [-f REGEX]
-        Find machine types free for LENGTH starting at START.
-        No START  -> ASAP: shows the earliest slot per type.
-        LENGTH: 4h, 2d, 1d12h, 90m (rounded up to hours; default 1h). `find 6` = 6h
-        START : 'tomorrow 9am', '12/2 15:00', '2026-12-02 3pm', 'fri 10:00'
-        -n  number of nodes of that type (default 1)
-        -f  only check types whose specs match REGEX (e.g. -f gpu, -f wisc, -f 100G)
-        e.g.  find 8h            find tomorrow 9am 4h          find 12/2 13:00 2d -n 2 -f gpu
-  hw [-f REGEX]          List the hardware catalog with free/total counts right now
-  show <#|type[@cluster]>  Full specs of one entry
-  reserve <#|type[@cluster]> [-r REASON] [-y]
-        Reserve the slot shown for that row by the last `find` (asks to confirm)
-  mine                   List your project's reservation groups
-  cancel <resgroup-id>   Delete one of your reservation groups (id prefix ok)
-  project [NAME]         Show / set the project used for searches & reservations
-  refresh                Re-download hardware specs, live counts and forecasts
-  login                  (Re)enter your CloudLab username + password (saved in the OS keychain)
-  logout [--forget]      Forget the saved web session (--forget: and the saved password)
-  /TEXT                  Search the last output (regex, case-insensitive); '/' alone = show all
+        Machine types free for LENGTH from START. No START = as soon as possible.
+        LENGTH  4h, 2d, 1d12h, 90m (default 1h; `find 6` = 6h)
+        START   'tomorrow 9am', '12/2 15:00', '2026-12-02 3pm', 'fri 10:00'
+        -n      number of nodes (default 1)     -f  filter specs: gpu, wisc, 100G ...
+        e.g.  find 8h      find tomorrow 9am 4h      find 12/2 13:00 2d -n 2 -f gpu
+  hw [-f REGEX]            Hardware catalog with free/total counts right now
+  show <#|type[@cluster]>  All specs of one entry
+  reserve <#> [-r REASON] [-y]
+                           Reserve that row's slot from the last `find`
+                           (checked with CloudLab first, then asks to confirm)
+  mine                     Your project's reservations
+  cancel <id>              Delete a reservation (id prefix is fine)
+
+EXPERIMENTS
+  exps [-a] [-m] [-f REGEX]
+                           Running experiments (yours + your projects'), soonest
+                           to expire first. -a include ended, -m only yours
+  exp <#|name>             Nodes of one experiment: host, type, image, ssh command
+
+KEEP EXPERIMENTS ALIVE
+  keep-alive <#|name> [--by 3d] [--lead 2d] [--until DATE] [-r REASON] [--no-reserve] [-n]
+                           Add an experiment to the keep-alive list. Once less than
+                           LEAD is left, ask CloudLab to extend it by BY (not past
+                           --until). If not fully granted, reserve the same nodes
+                           from its expiry instead. Waits 24h before re-asking.
+                           -n = dry run
+  keep-alive               Show the list, time left, and what was last done
+  unalive <#|name>         Take an experiment off the list
+  keep-alive tick [-n]     Check the list now
+  keep-alive install       Check every 30 min in the background (systemd/launchd),
+                           also after you quit cloudshell. `keep-alive uninstall`
+                           stops it; `keep-alive log` shows what it did.
+        ! Without `keep-alive install`, checks happen ONLY when you run
+          `keep-alive tick` (or add an experiment), not while the shell sits idle
+          or after you quit.
+
+ACCOUNT & MISC
+  project [NAME]           Show / set the project for searches and reservations
+  login                    Enter CloudLab username + password (saved in the keychain)
+  logout [--forget]        Forget the session (--forget: and the saved password)
+  refresh                  Re-download specs, live counts and forecasts
+  /TEXT                    Search the last output (regex); '/' alone shows it all
   help, quit
 
-Availability comes from the reservation forecast on cloudlab.us/resinfo.php,
-and reservations go through the same form as cloudlab.us/resgroup.php (checked
-first, then submitted after you confirm). Both use your CloudLab web login.
-  now / from ..  ASAP mode: earliest time COUNT nodes stay free for LENGTH
-  ✓ fits (N free)   free for your whole window (N = fewest free during it)
+FIND RESULTS
+  now / from ..             earliest time COUNT nodes stay free for LENGTH (ASAP mode)
+  ✓ fits (N free)           free for your whole window (N = fewest free during it)
   ✗ next .. (only N free)   not enough at your start; next slot that fits
-  ? likely   (API-search fallback only) slot exists but window not fully confirmed
+  ? likely                  (API fallback only) slot exists, window not fully confirmed
 """
 
 
@@ -888,6 +1050,7 @@ class Shell:
         self.last_out: Optional[Output] = None
         self.last_find: dict = {}        # {"results": {key: Avail}, "count":..,...}
         self.last_resgroups: list = []
+        self.last_exps: list = []
 
     # ---- setup ---------------------------------------------------------
     def load(self, force=False):
@@ -958,6 +1121,10 @@ class Shell:
             "reserve": self.cmd_reserve, "r": self.cmd_reserve,
             "mine": self.cmd_mine, "resgroups": self.cmd_mine, "list": self.cmd_mine,
             "cancel": self.cmd_cancel, "delete": self.cmd_cancel,
+            "exps": self.cmd_exps, "experiments": self.cmd_exps,
+            "exp": self.cmd_exp,
+            "keep-alive": self.cmd_keepalive, "keepalive": self.cmd_keepalive,
+            "alive": self.cmd_keepalive, "unalive": self.cmd_unalive,
             "project": self.cmd_project, "refresh": self.cmd_refresh,
             "login": self.cmd_login, "logout": self.cmd_logout,
             "help": self.cmd_help, "?": self.cmd_help,
@@ -1369,6 +1536,488 @@ class Shell:
         self.last_resgroups = [x for x in self.last_resgroups if x is not g]
         self.web._cache = (0.0, None, {})
 
+    # ---- experiments ---------------------------------------------------
+    ENDED = {"expired", "canceled", "terminated", "terminating", "quarantined"}
+
+    def cmd_exps(self, args, quiet=False):
+        opts, _ = split_opts(args, {"-a": "all!", "--all": "all!", "-m": "mine!",
+                                    "--mine": "mine!", "-f": "filter"})
+        exps = self.web.list_experiments()
+        total = len(exps)
+        if not opts.get("all"):
+            exps = [e for e in exps if (e.get("status") or "").lower() not in self.ENDED]
+        if opts.get("mine"):
+            exps = [e for e in exps if e.get("creator") == self.web.uid]
+        now = datetime.now(UTC)
+
+        def left(e) -> Optional[float]:
+            t = _parse_ts(e.get("expires"))
+            return (t - now).total_seconds() / 3600 if t else None
+
+        exps.sort(key=lambda e: (left(e) is None, left(e) or 0))
+        rows, colors = [], []
+        for e in exps:
+            h = left(e)
+            if h is None:
+                exp_s, col = "-", (lambda s: s)
+            elif h <= 0:
+                exp_s, col = "expired", red
+            else:
+                exp_s = f"{fmt_hours(int(h))} {int(h * 60) % 60:02d}m" if h < 24 else fmt_hours(int(h))
+                exp_s += f"  ({fmt_dt(_parse_ts(e.get('expires')))})"
+                col = red if h < 1 else yellow if h < 6 else green
+            rows.append([e.get("exp") or "?", e.get("pid") or "", e.get("cluster") or "-",
+                         str(e.get("pcount") or 0), e.get("status") or "-",
+                         e.get("creator") or "", e.get("profile_name") or "", exp_s])
+            colors.append(col)
+        if opts.get("filter"):
+            try:
+                rx = re.compile(opts["filter"], re.I)
+            except re.error:
+                rx = re.compile(re.escape(opts["filter"]), re.I)
+            keep = [i for i, r in enumerate(rows) if rx.search(" ".join(r))]
+            rows, colors, exps = ([rows[i] for i in keep], [colors[i] for i in keep],
+                                  [exps[i] for i in keep])
+        self.last_exps = exps
+        rows = [[str(i + 1)] + r for i, r in enumerate(rows)]
+        header, rendered = render_table(
+            ["#", "Experiment", "Project", "Cluster", "Nodes", "Status", "By",
+             "Profile", "Expires in"], rows, last_col_color=colors, shrink=(7, 1))
+        out = Output()
+        out.add_header(header)
+        for p, colored in rendered:
+            out.add(p, colored)
+        shown = "" if opts.get("all") else " running"
+        out.footer.append(f"{len(exps)}{shown} experiment(s) of {total} visible to "
+                          f"{self.web.uid} · exp <#> for nodes"
+                          + ("" if opts.get("all") else " · -a to include ended ones"))
+        if not quiet:
+            self.last_out = out
+            out.print()
+
+    def _lookup_exp(self, ref: str) -> dict:
+        if not self.last_exps:
+            self.cmd_exps([], quiet=True)
+        if ref.isdigit():
+            i = int(ref) - 1
+            if not 0 <= i < len(self.last_exps):
+                raise ValueError(f"no row {ref} in the last `exps` output")
+            return self.last_exps[i]
+        r = ref.lower()
+        exact = [e for e in self.last_exps if (e.get("exp") or "").lower() == r]
+        matches = exact or [e for e in self.last_exps
+                            if (e.get("exp") or "").lower().startswith(r)
+                            or (e.get("uuid") or "").lower().startswith(r)]
+        if len(matches) != 1:
+            raise ValueError(f"'{ref}' matches {len(matches)} experiments (run `exps`)")
+        return matches[0]
+
+    def cmd_exp(self, args):
+        if not args:
+            raise ValueError("usage: exp <#|name|uuid-prefix>")
+        e = self._lookup_exp(args[0])
+        nodes = self.web.experiment_nodes(e["uuid"])
+        print(bold(f"{e.get('pid')}/{e.get('exp')}") +
+              f"  {e.get('status')}  by {e.get('creator')}  profile {e.get('profile_name')}")
+        print(dim(f"  uuid {e['uuid']} · started {fmt_dt(_parse_ts(e.get('started')))}"
+                  f" · expires {fmt_dt(_parse_ts(e.get('expires')))}"))
+        print(dim(f"  {self.web.base}/status.php?uuid={e['uuid']}"))
+        rows = [[n["client_id"], n["host"], n["type"], self.cluster_name(n["cluster_urn"]),
+                 n["image"], ",".join(n["blockstores"]) or "-", n["ssh"]] for n in nodes]
+        header, rendered = render_table(
+            ["Node", "Host", "Type", "Cluster", "Image", "Blockstores", "SSH"],
+            rows, shrink=(4,))
+        out = Output()
+        out.add_header(header)
+        for p, colored in rendered:
+            out.add(p, colored)
+        out.footer.append(f"{len(nodes)} node(s)")
+        self.last_out = out
+        out.print()
+
+    # ---- keep-alive ----------------------------------------------------
+    # CloudLab's extension rules (apt/manage_instance.in, DoExtend): you can't ask
+    # while more than 7 days are left; requests made within 24h of expiry, 5 times
+    # in a row, count as "gaming" and get extensions refused. So: ask early
+    # (LEAD before expiry), and after any request that isn't fully granted, wait
+    # KA_BACKOFF_H before asking again (an admin may be reviewing it).
+    KA_BY_H = 72
+    KA_LEAD_H = 48
+    KA_MAX_LEAD_H = 6 * 24
+    KA_BACKOFF_H = 24
+    KA_REASON = "Ongoing work; kept alive by cloudshell for {uid}."
+    KA_LOG = CACHE_DIR / "keepalive.log"
+
+    @staticmethod
+    def _ka_load() -> dict:
+        a = load_state().get("alive")
+        return a if isinstance(a, dict) else {}
+
+    @staticmethod
+    def _ka_write(set_=None, remove=()):
+        """Update only the given entries, so a concurrent add/unalive isn't undone.
+        set_ entries whose key is no longer present are dropped (unalived meanwhile)
+        unless they are marked "_new"."""
+        cur = Shell._ka_load()
+        for k, v in (set_ or {}).items():
+            if k in cur or v.pop("_new", False):
+                cur[k] = v
+        for k in remove:
+            cur.pop(k, None)
+        save_state({"alive": cur})
+
+    def _ka_note(self, name: str, ent: dict, msg: str, color=None, dry=False):
+        stamp = datetime.now(LOCAL).strftime("%m-%d %H:%M")
+        if not dry:
+            ent["last"] = f"{stamp} {msg}"
+            if ent.get("last_msg") == msg:       # unchanged since last tick: don't spam the log
+                print(color(f"{name}: {msg}") if color else f"{name}: {msg}")
+                return
+            ent["last_msg"] = msg
+            try:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                with open(self.KA_LOG, "a") as f:
+                    f.write(f"{datetime.now(LOCAL).isoformat(timespec='seconds')} {name}: {msg}\n")
+            except OSError:
+                pass
+        line = f"{name}: {msg}"
+        print((dim("[dry run] ") if dry else "") + (color(line) if color else line))
+
+    def cmd_keepalive(self, args):
+        sub = args[0].lower() if args else ""
+        if not args:
+            return self._ka_list()
+        if sub == "tick":
+            opts, _ = split_opts(args[1:], {"-n": "dry!", "--dry-run": "dry!"})
+            return self.keepalive_tick(dry=bool(opts.get("dry")))
+        if sub == "install":
+            return self._ka_install()
+        if sub == "uninstall":
+            return self._ka_uninstall()
+        if sub == "log":
+            try:
+                lines = self.KA_LOG.read_text().splitlines()[-30:]
+            except OSError:
+                lines = []
+            print("\n".join(lines) if lines else dim("(no keep-alive activity yet)"))
+            return
+        opts, rest = split_opts(args, {
+            "--by": "by", "--lead": "lead", "--until": "until", "-r": "reason",
+            "--reason": "reason", "--no-reserve": "noreserve!", "-n": "dry!",
+            "--dry-run": "dry!"})
+        if not rest:
+            raise ValueError("usage: keep-alive <#|name> [--by 3d] [--lead 2d] "
+                             "[--until DATE] [-r REASON] [--no-reserve] [-n]")
+        e = self._lookup_exp(rest[0])
+        by = parse_duration(opts.get("by", f"{self.KA_BY_H}h"))
+        lead = parse_duration(opts.get("lead", f"{self.KA_LEAD_H}h"))
+        if not by:
+            raise ValueError(f"bad --by '{opts.get('by')}' (e.g. 1d, 72h)")
+        if not lead or lead > self.KA_MAX_LEAD_H:
+            raise ValueError(f"--lead must be between 1h and {fmt_hours(self.KA_MAX_LEAD_H)} "
+                             "(CloudLab refuses requests made more than 7 days ahead)")
+        now = datetime.now(UTC)
+        until = None
+        if opts.get("until"):
+            until = parse_start(opts["until"], now)
+            if until is None or until <= now:
+                raise ValueError(f"bad --until '{opts['until']}' (must be a future date)")
+        uuid = e["uuid"]
+        old = self._ka_load().get(uuid, {})
+        ent = dict(old)
+        ent.update({"exp": e.get("exp"), "pid": e.get("pid"), "by_h": by, "lead_h": lead,
+                    "until": until.astimezone(UTC).isoformat() if until else None,
+                    "reason": opts.get("reason") or old.get("reason")
+                    or self.KA_REASON.format(uid=self.web.uid),
+                    "reserve": not opts.get("noreserve"),
+                    "added": old.get("added") or now.isoformat()})
+        ent.pop("stopped", None)
+        name = f"{ent['pid']}/{ent['exp']}"
+        policy = (f"extend by {fmt_hours(by)} when < {fmt_hours(lead)} left"
+                  + (f", until {fmt_dt(until)}" if until else "")
+                  + ("" if ent["reserve"] else ", no reservation fallback"))
+        if e.get("creator") and e.get("creator") != self.web.uid:
+            print(yellow(f"! {name} was created by {e.get('creator')}; extending it needs "
+                         "project permissions and they'll get CloudLab's emails"))
+        if opts.get("dry"):
+            print(f"would keep {bold(name)} alive: {policy}")
+            self.keepalive_tick(dry=True, entries={uuid: ent})
+            return
+        ent["_new"] = True
+        self._ka_write({uuid: ent})
+        print(green(f"✓ keeping {name} alive: {policy}"))
+        self.keepalive_tick(only={uuid})
+        if not self._ka_timer_installed():
+            print(dim("  note: this only runs when `keep-alive tick` runs; "
+                      "`keep-alive install` runs it every 30 min in the background"))
+
+    def cmd_unalive(self, args):
+        if not args:
+            raise ValueError("usage: unalive <#|name|uuid-prefix>   (see `keep-alive`)")
+        alive = self._ka_load()
+        items = sorted(alive.items(), key=lambda kv: kv[1].get("expires") or "")
+        ref = args[0].lower()
+        if ref.isdigit() and 0 < int(ref) <= len(items):
+            matches = [items[int(ref) - 1]]
+        else:
+            exact = [kv for kv in items if (kv[1].get("exp") or "").lower() == ref]
+            matches = exact or [kv for kv in items
+                                if (kv[1].get("exp") or "").lower().startswith(ref)
+                                or kv[0].lower().startswith(ref)]
+        if len(matches) != 1:
+            raise ValueError(f"'{args[0]}' matches {len(matches)} kept-alive experiments "
+                             "(run `keep-alive`)")
+        uuid, ent = matches[0]
+        self._ka_write(remove=[uuid])
+        msg = f"✓ {ent.get('pid')}/{ent.get('exp')} will no longer be extended"
+        if ent.get("resgroup"):
+            msg += (f"; its reservation {ent['resgroup'][:8]} is kept "
+                    f"(`cancel {ent['resgroup'][:8]}` to free it)")
+        print(green(msg))
+
+    def _ka_list(self):
+        alive = self._ka_load()
+        if not alive:
+            print(dim("nothing is kept alive (keep-alive <#> after `exps` to add one)"))
+            return
+        now = datetime.now(UTC)
+        rows = []
+        for uuid, ent in sorted(alive.items(), key=lambda kv: kv[1].get("expires") or ""):
+            exp_t = _parse_ts(ent.get("expires"))
+            left = fmt_left((exp_t - now).total_seconds() / 3600) if exp_t else "?"
+            policy = f"+{fmt_hours(ent.get('by_h', 0))} at <{fmt_hours(ent.get('lead_h', 0))}"
+            if ent.get("until"):
+                policy += f" until {fmt_dt(_parse_ts(ent['until']))}"
+            resv = (ent.get("resgroup") or "")[:8] or ("-" if ent.get("reserve") else "off")
+            rows.append([str(len(rows) + 1), f"{ent.get('pid')}/{ent.get('exp')}", left,
+                         policy, resv, (ent.get("last") or "not checked yet")])
+        header, rendered = render_table(
+            ["#", "Experiment", "Expires in", "Policy", "Resv", "Last check"], rows,
+            shrink=(5, 3))
+        out = Output()
+        out.add_header(header)
+        for p, colored in rendered:
+            out.add(p, colored)
+        timer = "background timer on" if self._ka_timer_installed() else \
+            "no background timer: `keep-alive install`"
+        out.footer.append(f"{len(rows)} kept alive · {timer} · `keep-alive tick` checks now"
+                          " · `unalive <#>` stops")
+        self.last_out = out
+        out.print()
+
+    def keepalive_tick(self, dry=False, only=None, entries=None):
+        """One pass over the kept-alive experiments (run by the background timer)."""
+        alive = entries if entries is not None else self._ka_load()
+        if only:
+            alive = {k: v for k, v in alive.items() if k in only}
+        if not alive:
+            print(dim("nothing is kept alive"))
+            return
+        exps = {e["uuid"]: e for e in self.web.list_experiments()}
+        now = datetime.now(UTC)
+        for uuid, ent in alive.items():
+            name = f"{ent.get('pid')}/{ent.get('exp')}"
+            try:
+                self._ka_check(uuid, ent, exps.get(uuid), now, dry, name)
+            except (ValueError, WebLoginError, httpx.HTTPError) as ex:
+                self._ka_note(name, ent, f"error: {ex}", red, dry)
+        if not dry and entries is None:
+            self._ka_write(alive)
+
+    def _ka_check(self, uuid: str, ent: dict, e: Optional[dict], now: datetime,
+                  dry: bool, name: str):
+        def note(msg, color=None):
+            self._ka_note(name, ent, msg, color, dry)
+
+        status = ((e or {}).get("status") or "").lower()
+        if not e or status in self.ENDED:
+            ent["state"] = "ended"
+            note(f"experiment is {status or 'gone'}; nothing to extend (`unalive` it)", red)
+            return
+        exp_t = _parse_ts(e.get("expires"))
+        if not exp_t:
+            note("CloudLab shows no expiration time; skipped", yellow)
+            return
+        prev_exp = _parse_ts(ent.get("expires"))
+        ent["expires"] = e["expires"]
+        left_h = (exp_t - now).total_seconds() / 3600
+        until = _parse_ts(ent.get("until"))
+        if until and exp_t >= until - timedelta(minutes=30):
+            note(f"already runs until {fmt_dt(exp_t)} (--until {fmt_dt(until)}); done")
+            return
+        if ent.get("stopped"):
+            note(f"auto-extend stopped: {ent['stopped']} (re-run keep-alive to resume)", yellow)
+            return
+        nxt = _parse_ts(ent.get("next_try"))
+        if nxt and prev_exp and exp_t > prev_exp + timedelta(minutes=5):
+            ent.pop("next_try", None)          # expiry moved: an admin granted it
+            nxt = None
+            note(f"expiry moved to {fmt_dt(exp_t)} (granted)", green)
+        if left_h > ent.get("lead_h", self.KA_LEAD_H):
+            ask_at = exp_t - timedelta(hours=ent.get("lead_h", self.KA_LEAD_H))
+            note(f"{fmt_left(left_h)} left; will ask for more at {fmt_dt(ask_at)}")
+            return
+        if nxt and now < nxt:
+            note(f"{fmt_left(left_h)} left; last request wasn't fully granted, "
+                 f"asking again after {fmt_dt(nxt)}", yellow)
+            return
+
+        target = exp_t + timedelta(hours=ent.get("by_h", self.KA_BY_H))
+        if until:
+            target = min(target, until)
+        hours = math.ceil((target - exp_t).total_seconds() / 3600)
+        if hours < 1:
+            return
+        if dry:
+            note(f"{fmt_left(left_h)} left; would ask CloudLab to extend by {hours}h "
+                 f"(to {fmt_dt(target)})"
+                 + ("; if not granted, would reserve the same nodes until then"
+                    if ent.get("reserve") else ""))
+            return
+
+        d = self.web.request_extension(uuid, hours, ent.get("reason") or "")
+        v = d.get("value")
+        granted, new_exp = 0, exp_t
+        if d.get("code") == 0 and isinstance(v, dict):
+            granted = _int(v.get("granted"))
+            new_exp = _parse_ts(v.get("expiration")) or exp_t
+            ent["expires"] = v.get("expiration") or e["expires"]
+            msg = _plain(v.get("message"))
+            if granted:
+                note(f"extended by {granted}h; now expires {fmt_dt(new_exp)}", green)
+            if granted < hours:
+                note(f"{hours - granted}h more is waiting for an administrator"
+                     + (f" ({msg})" if msg else ""), yellow)
+            if v.get("warning"):
+                ent["stopped"] = _plain(v["warning"])[:200]
+                note("CloudLab warns: " + ent["stopped"], yellow)
+        else:
+            note(f"extension not granted: {_plain(v)[:200]}", yellow)
+        if granted < hours:
+            ent["next_try"] = (now + timedelta(hours=self.KA_BACKOFF_H)).isoformat()
+            if ent.get("reserve"):
+                self._ka_reserve(uuid, ent, new_exp, target, now, note)
+        else:
+            ent.pop("next_try", None)
+
+    def _ka_reserve(self, uuid, ent, start, end, now, note):
+        """Hold the experiment's node types for [start, end) via a reservation."""
+        resv_end = _parse_ts(ent.get("resgroup_end"))
+        if resv_end and resv_end >= end - timedelta(minutes=30):
+            return                                   # already covered
+        if resv_end and resv_end > start:
+            start = resv_end
+        if end - start < timedelta(hours=1):
+            return
+        counts: dict[tuple[str, str], int] = {}
+        for n in self.web.experiment_nodes(uuid):
+            if n["type"] != "-":
+                key = (n["cluster_urn"], n["type"])
+                counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            note("can't tell the node types; no reservation made", red)
+            return
+        clusters = [(u, t, c) for (u, t), c in counts.items()]
+        desc = ", ".join(f"{c}x {t}@{self.cluster_name(u)}" for u, t, c in clusters)
+        project = ent.get("pid") or self.project
+        if self.project and self.project.split("/")[0] == project:
+            project = self.project
+        when = f"{fmt_dt(start)} -> {fmt_dt(end)}"
+        st = start if start - now > timedelta(minutes=5) else None
+        ok, approval, problems, _ = resv_summary(
+            self.web.reserve(project, ent.get("reason") or "", st, end, clusters, True))
+        if not ok:
+            note(f"can't reserve {desc} {when}: {'; '.join(problems)[:200]}", red)
+            return
+        ok, approval, problems, rid = resv_summary(
+            self.web.reserve(project, ent.get("reason") or "", st, end, clusters, False))
+        if not ok:
+            note(f"reserving {desc} {when} failed: {'; '.join(problems)[:200]}", red)
+            return
+        ent["resgroup"] = rid
+        ent["resgroup_end"] = end.astimezone(UTC).isoformat()
+        note(f"reserved {desc} {when} ("
+             + ("waiting for admin approval" if approval else "approved")
+             + f"), id {rid[:8]}", green)
+
+    # background timer: systemd user timer (Linux) or launchd agent (macOS)
+    KA_UNIT = "cloudshell-keepalive"
+    KA_LABEL = "us.cloudlab.cloudshell.keepalive"
+
+    def _ka_paths(self) -> list[Path]:
+        if sys.platform == "darwin":
+            return [Path.home() / "Library/LaunchAgents" / f"{self.KA_LABEL}.plist"]
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        return [base / "systemd/user" / f"{self.KA_UNIT}.service",
+                base / "systemd/user" / f"{self.KA_UNIT}.timer"]
+
+    def _ka_timer_installed(self) -> bool:
+        return self._ka_paths()[-1].exists()
+
+    def ka_unattended_warning(self) -> Optional[str]:
+        """Warning text if experiments are kept alive but nothing will check them."""
+        n = len(self._ka_load())
+        if not n or self._ka_timer_installed():
+            return None
+        return (f"! {n} experiment(s) on the keep-alive list, but no background timer: "
+                "they are only extended when you run `keep-alive tick`. "
+                "Run `keep-alive install` to keep them alive after you quit.")
+
+    def _ka_install(self):
+        import subprocess
+        cmd = [sys.executable, str(Path(__file__).resolve()), "-c", "keep-alive tick"]
+        paths = self._ka_paths()
+        paths[0].parent.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "darwin":
+            import plistlib
+            with open(paths[0], "wb") as f:
+                plistlib.dump({"Label": self.KA_LABEL, "ProgramArguments": cmd,
+                               "StartInterval": 1800, "RunAtLoad": True,
+                               "StandardOutPath": str(CACHE_DIR / "keepalive.out"),
+                               "StandardErrorPath": str(CACHE_DIR / "keepalive.out")}, f)
+            r = subprocess.run(["launchctl", "load", "-w", str(paths[0])],
+                               capture_output=True, text=True)
+        else:
+            if not shutil.which("systemctl"):
+                print(red("systemctl not found. Add this line with `crontab -e` instead:"))
+                print(f"*/30 * * * * DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{os.getuid()}/bus "
+                      f"{shlex.join(cmd)} >> {CACHE_DIR / 'keepalive.out'} 2>&1")
+                return
+            paths[0].write_text(
+                "[Unit]\nDescription=cloudshell keep-alive: extend CloudLab experiments\n\n"
+                f"[Service]\nType=oneshot\nExecStart={shlex.join(cmd)}\n")
+            paths[1].write_text(
+                "[Unit]\nDescription=Run cloudshell keep-alive every 30 minutes\n\n"
+                "[Timer]\nOnBootSec=5min\nOnUnitActiveSec=30min\nPersistent=true\n\n"
+                "[Install]\nWantedBy=timers.target\n")
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+            r = subprocess.run(["systemctl", "--user", "enable", "--now",
+                                f"{self.KA_UNIT}.timer"], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(red(f"✗ could not start the timer: {(r.stderr or r.stdout).strip()}"))
+            return
+        print(green("✓ keep-alive now runs every 30 minutes in the background"))
+        print(dim(f"  files: {', '.join(map(str, paths))}"))
+        print(dim("  it uses the password/session in your keychain, so it works while you're "
+                  "logged in (keychain unlocked). `keep-alive log` shows what it did."))
+
+    def _ka_uninstall(self):
+        import subprocess
+        paths = self._ka_paths()
+        if not any(p.exists() for p in paths):
+            print(dim("no background timer installed"))
+            return
+        if sys.platform == "darwin":
+            subprocess.run(["launchctl", "unload", "-w", str(paths[0])], capture_output=True)
+        else:
+            subprocess.run(["systemctl", "--user", "disable", "--now", f"{self.KA_UNIT}.timer"],
+                           capture_output=True)
+        for p in paths:
+            p.unlink(missing_ok=True)
+        if sys.platform != "darwin":
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        print(green("✓ background keep-alive timer removed (kept-alive list is unchanged)"))
+
 
 # --------------------------------------------------------------------------
 # misc
@@ -1463,12 +2112,16 @@ def main(argv=None):
     print(bold("cloudshell") + dim(f" — {len(sh.catalog)} hardware types · user "
                                    f"{web.uid or '(login on first use)'} · project "
                                    f"{project or '(asked on first use)'} · type `help`"))
+    w = sh.ka_unattended_warning()
+    if w:
+        print(yellow(w))
     try:
         from prompt_toolkit import PromptSession
         from prompt_toolkit.completion import WordCompleter
         from prompt_toolkit.history import FileHistory
         if sys.stdin.isatty():
-            words = ["find", "hw", "show", "reserve", "mine", "cancel", "project",
+            words = ["find", "hw", "show", "reserve", "mine", "cancel", "exps", "exp",
+                     "keep-alive", "unalive", "tick", "install", "uninstall", "project",
                      "refresh", "login", "logout", "help", "quit"] + sorted({h.type for h in sh.catalog})
             _session = PromptSession(history=FileHistory(str(CACHE_DIR / "history")),
                                      completer=WordCompleter(words, ignore_case=True))
@@ -1484,6 +2137,9 @@ def main(argv=None):
             break
         if not sh.run(line):
             break
+    w = sh.ka_unattended_warning()
+    if w:
+        print(yellow(w))
 
 
 if __name__ == "__main__":
